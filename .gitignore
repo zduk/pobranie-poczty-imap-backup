@@ -5,6 +5,8 @@ __pycache__/
 mail_backup/
 gdrive_token.json
 gdrive_client_secret.json
+backup_progress.log
+run_gdrive*.log
 
 # Virtual environments
 .venv/
