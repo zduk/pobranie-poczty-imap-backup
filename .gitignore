@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Local backups and secrets
+mail_backup/
+gdrive_token.json
+gdrive_client_secret.json
+
+# Virtual environments
+.venv/
+venv/
