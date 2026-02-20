@@ -12,10 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 LIST_RE = re.compile(rb'\((?P<flags>.*?)\) "(?P<delimiter>.*?)" (?P<name>.+)')
-MESSAGES_RE = re.compile(rb"MESSAGES\s+(\d+)")
 DEFAULT_SERVER = "imap.dpoczta.pl"
 INVALID_PATH_CHARS = '<>:"/\\|?*'
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+UID_FILE_RE = re.compile(r"^(?P<uid>\d+)\.eml$")
+
+
+def uid_from_eml_file_name(file_name: str) -> int | None:
+    match = UID_FILE_RE.match(file_name)
+    if not match:
+        return None
+    return int(match.group("uid"))
 
 
 @dataclass
@@ -98,7 +105,7 @@ class GoogleDriveUploader:
         escaped = value.replace("\\", "\\\\").replace("'", "\\'")
         return f"'{escaped}'"
 
-    def ensure_folder(self, name: str, parent_id: str) -> str:
+    def find_folder(self, name: str, parent_id: str) -> str | None:
         cache_key = (parent_id, name)
         cached = self._folder_cache.get(cache_key)
         if cached:
@@ -125,6 +132,13 @@ class GoogleDriveUploader:
             folder_id = files[0]["id"]
             self._folder_cache[cache_key] = folder_id
             return folder_id
+        return None
+
+    def ensure_folder(self, name: str, parent_id: str) -> str:
+        cache_key = (parent_id, name)
+        existing_id = self.find_folder(name=name, parent_id=parent_id)
+        if existing_id:
+            return existing_id
 
         metadata = {
             "name": name,
@@ -231,6 +245,17 @@ class GoogleDriveUploader:
             files_by_name[file_name] = created_id
         return 1, 0
 
+    def max_uid_in_folder(self, folder_id: str) -> int | None:
+        max_uid: int | None = None
+        files_by_name = self._load_folder_files(folder_id)
+        for file_name in files_by_name:
+            uid = uid_from_eml_file_name(file_name)
+            if uid is None:
+                continue
+            if max_uid is None or uid > max_uid:
+                max_uid = uid
+        return max_uid
+
 
 def decode_imap_utf7(value: str) -> str:
     result: list[str] = []
@@ -313,9 +338,30 @@ def get_all_uids(client: imaplib.IMAP4_SSL) -> list[bytes]:
     return data[0].split()
 
 
+def get_uids_from(client: imaplib.IMAP4_SSL, start_uid: int | None) -> list[bytes]:
+    if start_uid is None or start_uid <= 1:
+        return get_all_uids(client)
+
+    status, data = client.uid("search", None, "UID", f"{start_uid}:*")
+    if status != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+def local_max_uid(folder_path: Path) -> int | None:
+    max_uid: int | None = None
+    for file_path in folder_path.glob("*.eml"):
+        uid = uid_from_eml_file_name(file_path.name)
+        if uid is None:
+            continue
+        if max_uid is None or uid > max_uid:
+            max_uid = uid
+    return max_uid
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Pobierz cala poczte IMAP do lokalnych plikow .eml"
+        description="Pobierz poczte IMAP do .eml (domyslnie tylko nowe maile)."
     )
     parser.add_argument(
         "--server",
@@ -341,6 +387,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Nadpisz juz pobrane pliki .eml.",
+    )
+    parser.add_argument(
+        "--full-scan",
+        action="store_true",
+        help=(
+            "Skanuj caly folder IMAP (wolniejsze). "
+            "Bez tego pobierane sa tylko nowe UID."
+        ),
+    )
+    parser.add_argument(
+        "--since-uid",
+        type=int,
+        help=(
+            "Minimalny UID (inclusive), od ktorego pobierac maile. "
+            "Dziala razem z trybem przyrostowym."
+        ),
     )
     parser.add_argument(
         "--progress-every",
@@ -473,24 +535,6 @@ def create_drive_uploader(
     )
 
 
-def mailbox_message_count(
-    client: imaplib.IMAP4_SSL,
-    mailbox_name: str,
-) -> int:
-    status, data = client.status(quote_mailbox(mailbox_name), "(MESSAGES)")
-    if status == "OK" and data:
-        for item in data:
-            if isinstance(item, (bytes, bytearray)):
-                match = MESSAGES_RE.search(bytes(item))
-                if match:
-                    return int(match.group(1))
-
-    status, _ = client.select(quote_mailbox(mailbox_name), readonly=True)
-    if status != "OK":
-        raise RuntimeError(f"Nie udalo sie policzyc folderu: {mailbox_name}")
-    return len(get_all_uids(client))
-
-
 def format_progress_line(
     stats: BackupStats,
     local_enabled: bool,
@@ -529,6 +573,40 @@ def format_progress_line(
     return ", ".join(parts)
 
 
+def resolve_incremental_start_uid(
+    folder_path: Path | None,
+    drive_uploader: GoogleDriveUploader | None,
+    drive_folder_id: str | None,
+    full_scan: bool,
+    since_uid: int | None,
+) -> int | None:
+    start_uid: int | None = None
+
+    if not full_scan:
+        known_uids: list[int] = []
+
+        if folder_path is not None:
+            local_uid = local_max_uid(folder_path)
+            if local_uid is not None:
+                known_uids.append(local_uid)
+
+        if drive_uploader is not None and drive_folder_id is not None:
+            drive_uid = drive_uploader.max_uid_in_folder(drive_folder_id)
+            if drive_uid is not None:
+                known_uids.append(drive_uid)
+
+        if known_uids:
+            start_uid = min(known_uids) + 1
+
+    if since_uid is not None:
+        if start_uid is None:
+            start_uid = since_uid
+        else:
+            start_uid = max(start_uid, since_uid)
+
+    return start_uid
+
+
 def download_mailbox(
     client: imaplib.IMAP4_SSL,
     mailbox: Mailbox,
@@ -538,19 +616,12 @@ def download_mailbox(
     progress_every: int,
     emit: Callable[[str], None],
     global_progress: GlobalProgress | None,
-    estimated_count: int | None,
+    full_scan: bool,
+    since_uid: int | None,
 ) -> BackupStats:
     status, _ = client.select(quote_mailbox(mailbox.encoded_name), readonly=True)
     if status != "OK":
         raise RuntimeError(f"Nie udalo sie otworzyc folderu: {mailbox.display_name}")
-
-    uids = get_all_uids(client)
-    if not uids:
-        return BackupStats()
-
-    if global_progress is not None:
-        known_count = estimated_count if estimated_count is not None else 0
-        global_progress.total_messages += len(uids) - known_count
 
     folder_name = safe_path_name(mailbox.display_name)
     folder_path: Path | None = None
@@ -560,6 +631,36 @@ def download_mailbox(
 
     drive_folder_id: str | None = None
     if drive_uploader is not None:
+        drive_folder_id = drive_uploader.find_folder(
+            name=folder_name,
+            parent_id=drive_uploader.root_folder_id,
+        )
+
+    start_uid = resolve_incremental_start_uid(
+        folder_path=folder_path,
+        drive_uploader=drive_uploader,
+        drive_folder_id=drive_folder_id,
+        full_scan=full_scan,
+        since_uid=since_uid,
+    )
+
+    uids = get_uids_from(client, start_uid)
+    if global_progress is not None:
+        global_progress.total_messages += len(uids)
+
+    if not uids:
+        if start_uid is None:
+            emit("  Brak maili do pobrania.")
+        else:
+            emit(f"  Brak nowych maili (od UID {start_uid}).")
+        return BackupStats()
+
+    if start_uid is None:
+        emit(f"  Pobieranie wszystkich maili: {len(uids)}")
+    else:
+        emit(f"  Pobieranie nowych maili (UID >= {start_uid}): {len(uids)}")
+
+    if drive_uploader is not None and drive_folder_id is None:
         drive_folder_id = drive_uploader.ensure_folder(
             name=folder_name,
             parent_id=drive_uploader.root_folder_id,
@@ -638,6 +739,9 @@ def run(args: argparse.Namespace) -> int:
     if args.gdrive_only and not args.gdrive_folder_id:
         print("Dla --gdrive-only podaj --gdrive-folder-id.")
         return 2
+    if args.since_uid is not None and args.since_uid < 1:
+        print("--since-uid musi byc >= 1")
+        return 2
 
     password = resolve_password(args.password)
     drive_enabled = bool(args.gdrive_folder_id)
@@ -691,39 +795,17 @@ def run(args: argparse.Namespace) -> int:
                     f"{args.gdrive_folder_id}"
                 )
 
-            emit(f"Liczenie maili do ETA ({len(mailboxes)} folderow)...")
-            estimated_total = 0
-            mailbox_counts: dict[str, int | None] = {}
-            for idx, mailbox in enumerate(mailboxes, start=1):
-                try:
-                    count = mailbox_message_count(client, mailbox.encoded_name)
-                    mailbox_counts[mailbox.encoded_name] = count
-                    estimated_total += count
-                except Exception as exc:
-                    mailbox_counts[mailbox.encoded_name] = None
-                    emit(
-                        "  UWAGA: pomijam ETA dla folderu "
-                        f"{mailbox.display_name} ({exc})"
-                    )
-
-                if idx % 10 == 0 or idx == len(mailboxes):
-                    emit(
-                        "  Liczenie ETA: "
-                        f"{idx}/{len(mailboxes)} folderow, maile={estimated_total}"
-                    )
-
-            global_progress = GlobalProgress(total_messages=estimated_total)
-            emit(f"Start transferu. Szacowana liczba maili: {estimated_total}")
+            mode = "pelny skan" if args.full_scan else "tryb przyrostowy (tylko nowe)"
+            emit(
+                "Start transferu: "
+                f"{mode}. Folderow IMAP: {len(mailboxes)}"
+            )
+            if args.since_uid is not None:
+                emit(f"Wymuszony start od UID >= {args.since_uid}")
+            global_progress = GlobalProgress(total_messages=0)
 
             for mailbox in mailboxes:
-                estimated_count = mailbox_counts.get(mailbox.encoded_name)
-                if estimated_count is None:
-                    emit(f"Folder: {mailbox.display_name} (liczba maili: nieznana)")
-                else:
-                    emit(
-                        f"Folder: {mailbox.display_name} "
-                        f"(liczba maili: {estimated_count})"
-                    )
+                emit(f"Folder: {mailbox.display_name}")
 
                 try:
                     stats = download_mailbox(
@@ -735,7 +817,8 @@ def run(args: argparse.Namespace) -> int:
                         progress_every=args.progress_every,
                         emit=emit,
                         global_progress=global_progress,
-                        estimated_count=estimated_count,
+                        full_scan=args.full_scan,
+                        since_uid=args.since_uid,
                     )
                 except Exception as exc:
                     emit(f"  BLAD: {exc}")
